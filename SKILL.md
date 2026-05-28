@@ -182,14 +182,45 @@ Build the standard trap wire-format report and hand it to the `tp` CLI.
 `tp` reads `~/.config/trapstreet/auth.json` for the api_key (the user
 already ran `tp auth login`), checks the public-repo rule, and POSTs.
 
+The skill submits under a **different solution identity** than the user's
+default `tp run` solution — closed-book in-session eval is a distinct
+agent. Default name: `<existing-solution>-eval` (e.g. `zhuaiz-eval`).
+Override via `TRAPSTREET_SOLUTION=my-name` in the user's shell before
+invoking.
+
+Important: do this **inside one Bash block** so the env vars carry
+through. Bash calls from different SKILL steps don't share state.
+
 ```bash
-python3 - <<'PY' > "$WORK/report.json"
-import json, pathlib, datetime, os, subprocess
+# Auth + server URL from the stored login (tp auth login).
+AUTH_FILE="$HOME/.config/trapstreet/auth.json"
+if [ ! -f "$AUTH_FILE" ]; then
+  echo "not logged in — run 'tp auth login' first"; exit 2
+fi
+API_KEY=$(python3 -c "import json; print(json.load(open('$AUTH_FILE'))['api_key'])")
+SERVER=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('server','https://trapstreet.run'))")
+
+# Look up the caller's existing solution name so we can derive a
+# distinct one for skill-driven runs.
+EXISTING_SOLUTION=$(curl -fsSL -H "authorization: Bearer $API_KEY" "$SERVER/api/me" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['solution']['name'])")
+
+# Solution name precedence: explicit TRAPSTREET_SOLUTION env > derived.
+SOLUTION_NAME="${TRAPSTREET_SOLUTION:-${EXISTING_SOLUTION}-eval}"
+MODEL="${CLAUDE_MODEL:-unknown}"
+
+echo "engine          = claude-code-skill-${MODEL}"
+echo "solution        = ${SOLUTION_NAME}"
+
+# Build the report. Pass SOLUTION_NAME and MODEL through env explicitly
+# so the python heredoc sees them.
+SOLUTION_NAME="$SOLUTION_NAME" MODEL="$MODEL" python3 - <<'PY' > "$WORK/report.json"
+import json, os, pathlib, datetime
+
 WORK = pathlib.Path("/tmp/trapstreet-eval")
 ids = [l.strip() for l in (WORK / "cases.txt").read_text().splitlines() if l.strip()]
 
 cases = []
-durations = []
 for cid in ids:
     metrics = json.loads((WORK / cid / "metrics.json").read_text())
     cases.append({
@@ -200,12 +231,8 @@ for cid in ids:
         "skipped": False,
     })
 
-# The user can pin which Claude model is being benchmarked by setting
-# CLAUDE_MODEL in their shell before invoking the skill. Defaults to
-# "unknown" otherwise — the leaderboard engine column will show
-# claude-code-skill-unknown.
-model = os.environ.get("CLAUDE_MODEL", "unknown")
-engine = f"claude-code-skill-{model}"
+model = os.environ["MODEL"]
+solution_name = os.environ["SOLUTION_NAME"]
 
 # Source-of-truth repo for THIS skill (closed-book in-session executor).
 # Lets the server's public-task rule pass and the leaderboard row link
@@ -214,17 +241,23 @@ SKILL_REPO = "https://github.com/trapstreet/trapstreet-eval"
 
 now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
-with open("task.json") as f:
+with open(WORK / "task.json") as f:
     task_obj = json.load(f)
 task_id = task_obj["task"]["id"]
 
 report = {
     "task_id": task_id,
+    # Top-level `solution` field — server's /api/submit/[task_id] reads
+    # this and lookup-or-creates a solution under the authed user with
+    # this name. Without it, server falls back to the api_key's default
+    # solution (whatever `tp auth login` minted), which mixes skill runs
+    # into your generic identity.
+    "solution": solution_name,
     "cases": cases,
     "started_at": now,
     "finished_at": now,
     "metadata": {
-        "engine": engine,
+        "engine": f"claude-code-skill-{model}",
         "repo": SKILL_REPO,
         "framework": "claude-code-skill",
         "strategy": "closed-book-in-session",
@@ -233,7 +266,9 @@ report = {
 }
 print(json.dumps(report, indent=2))
 PY
-echo "wrote report.json:"; head -5 "$WORK/report.json"
+
+echo "wrote report.json (solution=$SOLUTION_NAME):"
+head -8 "$WORK/report.json"
 ```
 
 Then submit. `tp submit --report` is the new flag (CLI ≥ 0.4.0) that
