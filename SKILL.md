@@ -1,6 +1,6 @@
 ---
 name: trapstreet-eval
-description: Closed-book model eval. Looks up a trapstreet task, fetches its case files (question + reference doc), hands each case to Claude (your current session) with NO tools and NO outside knowledge, runs the task's judge.py locally to score, then uploads the run to trapstreet.run via `tp submit`. Use when the user types `/trapstreet-eval [task-id]` (defaults to `financebench`), or asks to "run a trapstreet eval", "test Claude on financebench", "closed-book eval", and similar.
+description: Closed-book model eval. Runs a bundled trapstreet task (default `financebench`) against Claude in the current session with NO tools and NO outside knowledge — every question, reference doc, and judge.py is shipped inside this skill bundle, no network fetch at eval time. After grading, uploads the run to trapstreet.run via `tp submit`. Use when the user types `/trapstreet-eval [task-id]`, or asks to "run a trapstreet eval", "test Claude on financebench", "closed-book eval", and similar.
 ---
 
 # Trapstreet eval — closed-book model eval
@@ -15,10 +15,14 @@ using **ONLY** the content of the reference doc. No web search, no tool
 calls, no outside knowledge — even if you know the answer from training,
 pretend you don't.
 
-After grading, this skill **uploads the run** to trapstreet.run by
-shelling out to the `tp` CLI (which the user already authenticated via
-`tp auth login`). No bespoke HTTP from the skill — `tp submit` owns the
-upload contract.
+**All eval data is bundled inside this skill** —
+`~/.claude/skills/trapstreet-eval/tasks/<task-id>/`. No `curl` from
+github at eval time. The only network call is the final `tp submit`
+upload to trapstreet.run.
+
+After grading, this skill **uploads the run** by shelling out to the
+`tp` CLI (which the user already authenticated via `tp auth login`). No
+bespoke HTTP from the skill — `tp submit` owns the upload contract.
 
 ## Step 1 — Greet
 
@@ -27,47 +31,46 @@ you'll be evaluated closed-book. Example:
 
 ```
 Trapstreet eval — task: financebench
-Mode: closed-book (no tools, only the reference doc per case).
-Fetching cases…
+Mode: closed-book (no tools, only the bundled reference doc per case).
+Loading cases from ~/.claude/skills/trapstreet-eval/tasks/financebench/…
 ```
 
-## Step 2 — Resolve the task on trapstreet.run
+## Step 2 — Locate the bundled task
 
-Use Bash to look up the task and derive the GitHub raw URL for its
-files:
+Use Bash to set up the workspace and validate the task exists in the
+bundle:
 
 ```bash
 TASK_ID="${TASK_ID:-financebench}"
+SKILL_DIR="$HOME/.claude/skills/trapstreet-eval"
+TASK_DIR="$SKILL_DIR/tasks/$TASK_ID"
 WORK=/tmp/trapstreet-eval
-rm -rf "$WORK" && mkdir -p "$WORK" && cd "$WORK"
+rm -rf "$WORK" && mkdir -p "$WORK"
 
-curl -fsSL "https://trapstreet.run/api/tasks/${TASK_ID}" > task.json
-
-TRAPTASK_REF=$(python3 -c "import json,sys; print(json.load(open('task.json'))['task']['traptask_ref'])")
-# traptask_ref is "owner/repo" or "owner/repo/sub/path" — split into the two pieces
-OWNER_REPO=$(echo "$TRAPTASK_REF" | cut -d/ -f1-2)
-SUBPATH=$(echo "$TRAPTASK_REF" | cut -d/ -f3-)
-[ -n "$SUBPATH" ] && SUBPATH="/$SUBPATH"
-GH_RAW_BASE="https://raw.githubusercontent.com/${OWNER_REPO}/main${SUBPATH}"
+if [ ! -d "$TASK_DIR" ]; then
+  echo "task '$TASK_ID' is not bundled in this skill."
+  echo "available tasks:"
+  ls "$SKILL_DIR/tasks/" 2>/dev/null || echo "  (none — skill install is broken)"
+  exit 1
+fi
 
 echo "task_id      = $TASK_ID"
-echo "traptask_ref = $TRAPTASK_REF"
-echo "raw base     = $GH_RAW_BASE"
+echo "task_dir     = $TASK_DIR"
+echo "work_dir     = $WORK"
 ```
 
-If the curl fails, stop and tell the user the task id isn't on
-trapstreet.run.
+If the directory check fails, stop and tell the user the task id isn't
+bundled. (Adding a new task = drop a new directory under `tasks/`,
+re-run `install.sh`. It's not the skill's job to discover tasks at
+runtime.)
 
-## Step 3 — Pull traptask.yaml + judge.py + the list of cases
+## Step 3 — Extract the case list from the bundled traptask.yaml
 
 ```bash
-curl -fsSL "$GH_RAW_BASE/traptask.yaml" -o traptask.yaml
-curl -fsSL "$GH_RAW_BASE/judge.py" -o judge.py
-
-# Extract case ids. Looks for lines like "  - id: foo_bar".
-python3 - <<'PY' > cases.txt
+# Same case-id extractor as before, but reads from disk instead of curl.
+python3 - <<PY > "$WORK/cases.txt"
 import re, pathlib
-text = pathlib.Path("traptask.yaml").read_text()
+text = pathlib.Path("$TASK_DIR/traptask.yaml").read_text()
 inside = False
 for line in text.splitlines():
     if re.match(r"^cases:\s*$", line):
@@ -75,39 +78,40 @@ for line in text.splitlines():
         continue
     if inside and re.match(r"^[A-Za-z_]", line):
         break
-    m = re.match(r"^\s*-\s+id:\s*['\"]?([\w-]+)['\"]?\s*$", line)
+    m = re.match(r"^\s*-\s+id:\s*['\"]?([\w-]+)['\"]?\s*\$", line)
     if m and inside:
         print(m.group(1))
 PY
 
-echo "cases to evaluate ($(wc -l < cases.txt | tr -d ' ')):"
-cat cases.txt
+echo "cases to evaluate ($(wc -l < "$WORK/cases.txt" | tr -d ' ')):"
+cat "$WORK/cases.txt"
 ```
 
 ## Step 4 — For each case: read → answer closed-book → grade
 
-**Do this per case, sequentially**. For each `case_id` in `cases.txt`:
+**Do this per case, sequentially**. For each `case_id` in
+`$WORK/cases.txt`:
 
-### 4a. Fetch the case's files
+### 4a. Read the case files (they're already on disk — no fetch)
 
-```bash
-case_id="$1"
-mkdir -p "$WORK/$case_id"
-curl -fsSL "$GH_RAW_BASE/inputs/$case_id/question.txt" -o "$WORK/$case_id/question.txt"
-curl -fsSL "$GH_RAW_BASE/inputs/$case_id/doc.txt"      -o "$WORK/$case_id/doc.txt"
-curl -fsSL "$GH_RAW_BASE/expected/$case_id/answer.json" -o "$WORK/$case_id/answer.json"
+The bundle layout mirrors the task's source repo exactly:
+
+```
+$TASK_DIR/
+├── traptask.yaml
+├── judge.py
+├── inputs/<case_id>/{question.txt, doc.txt}
+└── expected/<case_id>/answer.json
 ```
 
+Use the Read tool on `$TASK_DIR/inputs/<case_id>/question.txt` and
+`$TASK_DIR/inputs/<case_id>/doc.txt`. Read them **both fully**. Don't
+skim.
+
 (If `inputs/<case_id>/` contains files other than `question.txt` /
-`doc.txt`, fetch those too. Inspect `$GH_RAW_BASE` via the GitHub
-contents API if needed.)
+`doc.txt`, read those too.)
 
-### 4b. Read the two files yourself
-
-Use the Read tool (or `cat`) on `$WORK/$case_id/question.txt` and
-`$WORK/$case_id/doc.txt`. Read them **both fully**. Don't skim.
-
-### 4c. Answer closed-book
+### 4b. Answer closed-book
 
 Working from **only** the content of `doc.txt`:
 
@@ -128,26 +132,28 @@ the number will throw off the match. Examples of acceptable formats:
 Use Bash to write:
 
 ```bash
+mkdir -p "$WORK/$case_id"
 echo "<just the answer>" > "$WORK/$case_id/stdout"
 ```
 
-### 4d. Run the judge
+### 4c. Run the judge
 
 ```bash
 PAYLOAD=$(python3 -c "
 import json, sys
-case_id, work = sys.argv[1], sys.argv[2]
+case_id, task_dir, work = sys.argv[1], sys.argv[2], sys.argv[3]
 print(json.dumps({
   'inputs': {
-    'question.txt': f'{work}/{case_id}/question.txt',
-    'doc.txt':      f'{work}/{case_id}/doc.txt',
+    'question.txt': f'{task_dir}/inputs/{case_id}/question.txt',
+    'doc.txt':      f'{task_dir}/inputs/{case_id}/doc.txt',
   },
   'outputs': {'stdout': f'{work}/{case_id}/stdout'},
-  'expected': {'answer.json': f'{work}/{case_id}/answer.json'},
+  'expected': {'answer.json': f'{task_dir}/expected/{case_id}/answer.json'},
 }))
-" "$case_id" "$WORK")
+" "$case_id" "$TASK_DIR" "$WORK")
 
-TRAPTASK_PAYLOAD="$PAYLOAD" python3 judge.py | tee "$WORK/$case_id/metrics.json"
+TRAPTASK_PAYLOAD="$PAYLOAD" python3 "$TASK_DIR/judge.py" \
+  | tee "$WORK/$case_id/metrics.json"
 ```
 
 ## Step 5 — Summary
@@ -208,13 +214,17 @@ EXISTING_SOLUTION=$(curl -fsSL -H "authorization: Bearer $API_KEY" "$SERVER/api/
 # Solution name precedence: explicit TRAPSTREET_SOLUTION env > derived.
 SOLUTION_NAME="${TRAPSTREET_SOLUTION:-${EXISTING_SOLUTION}-eval}"
 MODEL="${CLAUDE_MODEL:-unknown}"
+# TASK_ID was set in Step 2; carry it forward here for the report.
+TASK_ID="${TASK_ID:-financebench}"
 
 echo "engine          = claude-code-skill-${MODEL}"
 echo "solution        = ${SOLUTION_NAME}"
+echo "task_id         = ${TASK_ID}"
 
-# Build the report. Pass SOLUTION_NAME and MODEL through env explicitly
+# Build the report. Pass everything the heredoc needs through env explicitly
 # so the python heredoc sees them.
-SOLUTION_NAME="$SOLUTION_NAME" MODEL="$MODEL" python3 - <<'PY' > "$WORK/report.json"
+SOLUTION_NAME="$SOLUTION_NAME" MODEL="$MODEL" TASK_ID="$TASK_ID" \
+python3 - <<'PY' > /tmp/trapstreet-eval/report.json
 import json, os, pathlib, datetime
 
 WORK = pathlib.Path("/tmp/trapstreet-eval")
@@ -233,6 +243,7 @@ for cid in ids:
 
 model = os.environ["MODEL"]
 solution_name = os.environ["SOLUTION_NAME"]
+task_id = os.environ["TASK_ID"]
 
 # Source-of-truth repo for THIS skill (closed-book in-session executor).
 # Lets the server's public-task rule pass and the leaderboard row link
@@ -240,10 +251,6 @@ solution_name = os.environ["SOLUTION_NAME"]
 SKILL_REPO = "https://github.com/trapstreet/trapstreet-eval"
 
 now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-with open(WORK / "task.json") as f:
-    task_obj = json.load(f)
-task_id = task_obj["task"]["id"]
 
 report = {
     "task_id": task_id,
@@ -268,15 +275,9 @@ print(json.dumps(report, indent=2))
 PY
 
 echo "wrote report.json (solution=$SOLUTION_NAME):"
-head -8 "$WORK/report.json"
-```
+head -8 /tmp/trapstreet-eval/report.json
 
-Then submit. `tp submit --report` is the new flag (CLI ≥ 0.4.0) that
-takes a hand-built report.json and skips the workspace lookup:
-
-```bash
-TASK_ID=$(python3 -c "import json; print(json.load(open('/tmp/trapstreet-eval/task.json'))['task']['id'])")
-tp submit "$TASK_ID" --report "$WORK/report.json"
+tp submit "$TASK_ID" --report /tmp/trapstreet-eval/report.json
 ```
 
 `tp` will print the leaderboard URL on success. If it errors:
@@ -292,7 +293,11 @@ Then tell the user that's the local + uploaded result.
 ## What NOT to do
 
 - ❌ Don't use web search, web fetch, or any tool other than reading
-  the per-case files we already downloaded.
+  the bundled case files. They're already on disk under
+  `~/.claude/skills/trapstreet-eval/tasks/<task_id>/`.
+- ❌ Don't `curl` task data from github at runtime. If a task isn't in
+  the bundle, fail clean and ask the user to update the skill —
+  silently going to the network breaks reproducibility.
 - ❌ Don't add explanations to the answer file. The judge picks the
   first number; prose breaks the match.
 - ❌ Don't try to "be helpful" by correcting the gold answer — emit
