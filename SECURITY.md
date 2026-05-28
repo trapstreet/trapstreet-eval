@@ -15,20 +15,16 @@ to upgrade.
 
 ## What the installer does
 
-`install.sh` writes files into a single user-owned directory:
+`install.sh` writes one file to a single user-owned directory:
 
 ```
 ~/.claude/skills/trapstreet-eval/
-├── SKILL.md
-├── SECURITY.md
-├── README.md
-└── tasks/
-    └── <task_id>/
-        ├── traptask.yaml
-        ├── judge.py
-        ├── inputs/<case_id>/{question.txt, doc.txt}
-        └── expected/<case_id>/answer.json
+└── SKILL.md
 ```
+
+In local mode it copies the sibling `SKILL.md` from the checkout. In
+remote mode (`bash <(curl)`) it downloads `SKILL.md` from
+`raw.githubusercontent.com/trapstreet/trapstreet-eval/main`.
 
 It does **not**:
 
@@ -36,8 +32,7 @@ It does **not**:
 - Modify shell startup files (`.zshrc`, `.bashrc`, `.profile`, …).
 - Install launch agents, login items, cron jobs, or daemons.
 - Touch any path outside `~/.claude/skills/trapstreet-eval/`.
-- Send telemetry, analytics, or any network request beyond the initial
-  `git clone` of this repo (and only in remote-install mode).
+- Send telemetry or analytics.
 
 To uninstall:
 
@@ -47,19 +42,23 @@ rm -rf ~/.claude/skills/trapstreet-eval
 
 ## What the skill does at eval time
 
-When invoked as `/trapstreet-eval [task-id]`, the skill:
+When invoked as `/trapstreet-eval [task-id]`, the skill (via Claude's
+Bash tool, with the user's approval at each step) fetches:
 
-1. **Reads** bundled files from `~/.claude/skills/trapstreet-eval/tasks/<task_id>/`.
-   No network fetch for task data, judge code, or case files.
-2. Runs the bundled `judge.py` (stdlib-only Python; no third-party
-   dependencies) locally in the user's Python.
-3. Calls `tp submit` (which the user installed and authenticated via
-   `tp auth login`) to upload the report to trapstreet.run. This is the
-   only outbound network call at eval time.
+1. `https://trapstreet.run/api/tasks/<task-id>` — task metadata, which
+   contains the source repo (`traptask_ref`) on GitHub.
+2. `raw.githubusercontent.com/<traptask_ref>/...` — the task's
+   `traptask.yaml`, `judge.py`, and per-case `inputs/` + `expected/`
+   files.
+3. `judge.py` runs locally in the user's Python to score each case.
+4. `tp submit` uploads the final report to trapstreet.run (the user
+   already authenticated this CLI via `tp auth login`).
 
 The skill does **not** evaluate models against arbitrary remote
-endpoints, run untrusted code from the network, or hit any URL beyond
-the user's pre-authenticated `tp submit`.
+endpoints. The only code that runs locally is the task's `judge.py`,
+fetched from the public GitHub repo referenced by the trapstreet.run
+task entry — the same code anyone running `tp run` against that task
+would execute.
 
 ## Trust model
 
@@ -67,23 +66,20 @@ When you run the installer, you trust:
 
 1. **GitHub** as the source-code host and TLS endpoint.
 2. **The maintainers' GitHub credentials.** We enforce 2FA and protected
-   branches; releases require code review.
-3. **The contents of `main`** at install time. There is no auto-update —
-   the skill files on disk only change when you re-run `install.sh`.
+   branches; changes to `main` require code review.
 
-When you run the skill (after install), you do **not** trust any
-network source for the eval payload. Everything that runs is on disk,
-inspectable via:
+When you run the skill, you additionally trust:
 
-```sh
-ls -la ~/.claude/skills/trapstreet-eval/tasks/financebench/
-cat   ~/.claude/skills/trapstreet-eval/SKILL.md
-cat   ~/.claude/skills/trapstreet-eval/tasks/financebench/judge.py
-```
+3. **trapstreet.run** to return a non-malicious `traptask_ref` for the
+   task id you pass.
+4. **The task's source repo on GitHub** (whatever `traptask_ref` points
+   at) to host a non-malicious `judge.py`. Read it before running an
+   unfamiliar task:
+   ```sh
+   cat /tmp/trapstreet-eval/judge.py   # after Step 3 in SKILL.md
+   ```
 
 ## Trust-but-verify install path
-
-We expect users to read what runs on their machine. The recommended path:
 
 ```sh
 git clone https://github.com/trapstreet/trapstreet-eval
@@ -103,8 +99,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/trapstreet/trapstreet-eval/m
 
 - `main` is protected; changes require code review.
 - Maintainer accounts have 2FA enforced.
-- The skill ships with no third-party Python dependencies — `judge.py`
-  is stdlib-only — so the install footprint is auditable in a single
-  `cat`.
 - We do not auto-update installed skills. Upgrades are opt-in: re-run
   `install.sh`.
